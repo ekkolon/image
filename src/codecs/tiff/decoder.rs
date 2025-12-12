@@ -1,10 +1,3 @@
-//! Decoding and Encoding of TIFF Images
-//!
-//! TIFF (Tagged Image File Format) is a versatile image format that supports
-//! lossless and lossy compression.
-//!
-//! # Related Links
-//! * <http://partners.adobe.com/public/developer/tiff/index.html> - The TIFF specification
 use std::io::{self, BufRead, Cursor, Read, Seek, Write};
 use std::marker::PhantomData;
 use std::mem;
@@ -14,12 +7,14 @@ use tiff::tags::Tag;
 
 use crate::color::{ColorType, ExtendedColorType};
 use crate::error::{
-    DecodingError, EncodingError, ImageError, ImageResult, LimitError, LimitErrorKind,
-    ParameterError, ParameterErrorKind, UnsupportedError, UnsupportedErrorKind,
+    DecodingError, ImageError, ImageResult, LimitError, LimitErrorKind, UnsupportedError,
+    UnsupportedErrorKind,
 };
 use crate::metadata::Orientation;
-use crate::{utils, ImageDecoder, ImageEncoder, ImageFormat};
+use crate::{utils, ImageDecoder, ImageFormat};
 
+const TAG_YCBCR_COEFFICIENTS: Tag = Tag::Unknown(529);
+const TAG_YCBCR_REFERENCE_BLACK_WHITE: Tag = Tag::Unknown(532);
 const TAG_XML_PACKET: Tag = Tag::Unknown(700);
 
 /// Decoder for TIFF images.
@@ -91,7 +86,11 @@ where
             }
             tiff::ColorType::GrayA(n) => return Err(err_unknown_color_type(n.saturating_mul(2))),
             tiff::ColorType::RGB(n) => return Err(err_unknown_color_type(n.saturating_mul(3))),
-            tiff::ColorType::YCbCr(n) => return Err(err_unknown_color_type(n.saturating_mul(3))),
+            tiff::ColorType::YCbCr(n) => match n {
+                8 => ColorType::Rgb8,
+                16 => ColorType::Rgb16,
+                _ => return Err(err_unknown_color_type(n.saturating_mul(3))),
+            },
             tiff::ColorType::RGBA(n) | tiff::ColorType::CMYK(n) => {
                 return Err(err_unknown_color_type(n.saturating_mul(4)))
             }
@@ -206,26 +205,6 @@ impl ImageError {
             }
         }
     }
-
-    fn from_tiff_encode(err: tiff::TiffError) -> ImageError {
-        match err {
-            tiff::TiffError::IoError(err) => ImageError::IoError(err),
-            err @ (tiff::TiffError::FormatError(_)
-            | tiff::TiffError::IntSizeError
-            | tiff::TiffError::UsageError(_)) => {
-                ImageError::Encoding(EncodingError::new(ImageFormat::Tiff.into(), err))
-            }
-            tiff::TiffError::UnsupportedError(desc) => {
-                ImageError::Unsupported(UnsupportedError::from_format_and_kind(
-                    ImageFormat::Tiff.into(),
-                    UnsupportedErrorKind::GenericFeature(desc.to_string()),
-                ))
-            }
-            tiff::TiffError::LimitsExceeded => {
-                ImageError::Limits(LimitError::from_kind(LimitErrorKind::InsufficientMemory))
-            }
-        }
-    }
 }
 
 /// Wrapper struct around a `Cursor<Vec<u8>>`
@@ -247,6 +226,10 @@ impl<R> Read for TiffReader<R> {
         }
     }
 }
+
+const YCBCR_LIMITED_RANGE_U8_DEFAULTS: [f32; 6] = [16.0, 235.0, 16.0, 240.0, 16.0, 240.0];
+const YCBCR_LIMITED_RANGE_U16_DEFAULTS: [f32; 6] =
+    [4112.0, 60495.0, 4112.0, 61680.0, 4112.0, 61680.0];
 
 impl<R: BufRead + Seek> ImageDecoder for TiffDecoder<R> {
     fn dimensions(&self) -> (u32, u32) {
@@ -322,12 +305,9 @@ impl<R: BufRead + Seek> ImageDecoder for TiffDecoder<R> {
     fn read_image(self, buf: &mut [u8]) -> ImageResult<()> {
         assert_eq!(u64::try_from(buf.len()), Ok(self.total_bytes()));
 
-        match self
-            .inner
-            .unwrap()
-            .read_image()
-            .map_err(ImageError::from_tiff_decode)?
-        {
+        let mut inner = self.inner.unwrap();
+
+        match inner.read_image().map_err(ImageError::from_tiff_decode)? {
             DecodingResult::U8(v) if self.original_color_type == ExtendedColorType::Cmyk8 => {
                 let mut out_cur = Cursor::new(buf);
                 for cmyk in v.chunks_exact(4) {
@@ -349,6 +329,78 @@ impl<R: BufRead + Seek> ImageDecoder for TiffDecoder<R> {
                     .zip(buf.chunks_exact_mut(width as usize))
                 {
                     out_row.copy_from_slice(&utils::expand_bits(1, width, in_row));
+                }
+            }
+            DecodingResult::U8(v) if self.color_type == ColorType::Rgb8 => {
+                // TODO: get `luma` and `ref_bw_vec` once and reuse below for DecodingResult::U16
+
+                let luma = inner
+                    .find_tag(TAG_YCBCR_COEFFICIENTS)
+                    .ok()
+                    .and_then(|opt| opt)
+                    .and_then(|val| val.into_f32_vec().ok());
+
+                let ref_bw_vec = inner
+                    .find_tag(TAG_YCBCR_REFERENCE_BLACK_WHITE)
+                    .ok()
+                    .and_then(|opt| opt)
+                    .and_then(|val| val.into_f32_vec().ok());
+
+                let coeffs = luma
+                    .as_ref()
+                    .map(YCbCrCoefficients::from_luma)
+                    .unwrap_or_default();
+
+                let ref_bw = if let Some(rbw) = ref_bw_vec.as_ref() {
+                    if rbw.len() >= 6 {
+                        [rbw[0], rbw[1], rbw[2], rbw[3], rbw[4], rbw[5]]
+                    } else {
+                        YCBCR_LIMITED_RANGE_U8_DEFAULTS
+                    }
+                } else {
+                    YCBCR_LIMITED_RANGE_U8_DEFAULTS
+                };
+
+                let mut out_cur = Cursor::new(buf);
+                for ycbcr_pixel in v.chunks_exact(3) {
+                    let ycbcr_bytes = ycbcr_to_rgb(ycbcr_pixel, &coeffs, &ref_bw);
+                    let bytes = bytemuck::cast_slice(&ycbcr_bytes);
+                    out_cur.write_all(bytes)?;
+                }
+            }
+            DecodingResult::U16(v) if self.color_type == ColorType::Rgb16 => {
+                let luma = inner
+                    .find_tag(TAG_YCBCR_COEFFICIENTS)
+                    .ok()
+                    .and_then(|opt| opt)
+                    .and_then(|val| val.into_f32_vec().ok());
+
+                let ref_bw_vec = inner
+                    .find_tag(TAG_YCBCR_REFERENCE_BLACK_WHITE)
+                    .ok()
+                    .and_then(|opt| opt)
+                    .and_then(|val| val.into_f32_vec().ok());
+
+                let coeffs = luma
+                    .as_ref()
+                    .map(YCbCrCoefficients::from_luma)
+                    .unwrap_or_default();
+
+                let ref_bw = if let Some(rbw) = ref_bw_vec.as_ref() {
+                    if rbw.len() >= 6 {
+                        [rbw[0], rbw[1], rbw[2], rbw[3], rbw[4], rbw[5]]
+                    } else {
+                        YCBCR_LIMITED_RANGE_U16_DEFAULTS
+                    }
+                } else {
+                    YCBCR_LIMITED_RANGE_U16_DEFAULTS
+                };
+
+                let mut out_cur = Cursor::new(buf);
+                for ycbcr_pixel in v.chunks_exact(3) {
+                    let ycbcr_bytes = ycbcr_to_rgb16(ycbcr_pixel, &coeffs, &ref_bw);
+                    let bytes = bytemuck::cast_slice(&ycbcr_bytes);
+                    out_cur.write_all(bytes)?;
                 }
             }
             DecodingResult::U8(v) => {
@@ -391,11 +443,6 @@ impl<R: BufRead + Seek> ImageDecoder for TiffDecoder<R> {
     }
 }
 
-/// Encoder for tiff images
-pub struct TiffEncoder<W> {
-    w: W,
-}
-
 fn cmyk_to_rgb(cmyk: &[u8]) -> [u8; 3] {
     let c = f32::from(cmyk[0]);
     let m = f32::from(cmyk[1]);
@@ -420,114 +467,110 @@ fn cmyk_to_rgb16(cmyk: &[u16]) -> [u16; 3] {
     ]
 }
 
-/// Convert a slice of sample bytes to its semantic type, being a `Pod`.
-fn u8_slice_as_pod<P: bytemuck::Pod>(buf: &[u8]) -> ImageResult<std::borrow::Cow<'_, [P]>> {
-    bytemuck::try_cast_slice(buf)
-        .map(std::borrow::Cow::Borrowed)
-        .or_else(|err| {
-            match err {
-                bytemuck::PodCastError::TargetAlignmentGreaterAndInputNotAligned => {
-                    // If the buffer is not aligned for a native slice, copy the buffer into a Vec,
-                    // aligning it in the process. This is only done if the element count can be
-                    // represented exactly.
-                    let vec = bytemuck::allocation::pod_collect_to_vec(buf);
-                    Ok(std::borrow::Cow::Owned(vec))
-                }
-                /* only expecting: bytemuck::PodCastError::OutputSliceWouldHaveSlop */
-                _ => {
-                    // `bytemuck::PodCastError` of bytemuck-1.2.0 does not implement `Error` and
-                    // `Display` trait.
-                    // See <https://github.com/Lokathor/bytemuck/issues/22>.
-                    Err(ImageError::Parameter(ParameterError::from_kind(
-                        ParameterErrorKind::Generic(format!(
-                            "Casting samples to their representation failed: {err:?}",
-                        )),
-                    )))
-                }
-            }
-        })
+/// YCbCr to RGB conversion coefficients based on luma values
+///
+/// Conversion logic is taken from: https://libtiff.gitlab.io/libtiff/_sources/functions/TIFFcolor.rst.txt
+struct YCbCrCoefficients {
+    cr_r: f32,
+    cb_b: f32,
+    cr_g: f32,
+    cb_g: f32,
 }
 
-impl<W: Write + Seek> TiffEncoder<W> {
-    /// Create a new encoder that writes its output to `w`
-    pub fn new(w: W) -> TiffEncoder<W> {
-        TiffEncoder { w }
-    }
+const TIFF_BT_601_COEFF: [f32; 3] = [0.299, 0.587, 0.114];
 
-    /// Encodes the image `image` that has dimensions `width` and `height` and `ColorType` `c`.
-    ///
-    /// 16-bit types assume the buffer is native endian.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `width * height * color_type.bytes_per_pixel() != data.len()`.
-    #[track_caller]
-    pub fn encode(
-        self,
-        buf: &[u8],
-        width: u32,
-        height: u32,
-        color_type: ExtendedColorType,
-    ) -> ImageResult<()> {
-        use tiff::encoder::colortype::{
-            Gray16, Gray8, RGB32Float, RGBA32Float, RGB16, RGB8, RGBA16, RGBA8,
+impl YCbCrCoefficients {
+    fn from_luma<L: AsRef<[f32]>>(luma: L) -> Self {
+        let luma = luma.as_ref();
+        let (kr, kg, kb) = if luma.len() >= 3 {
+            (luma[0], luma[1], luma[2])
+        } else {
+            (
+                TIFF_BT_601_COEFF[0],
+                TIFF_BT_601_COEFF[1],
+                TIFF_BT_601_COEFF[2],
+            )
         };
-        let expected_buffer_len = color_type.buffer_size(width, height);
-        assert_eq!(
-            expected_buffer_len,
-            buf.len() as u64,
-            "Invalid buffer length: expected {expected_buffer_len} got {} for {width}x{height} image",
-            buf.len(),
-        );
-        let mut encoder =
-            tiff::encoder::TiffEncoder::new(self.w).map_err(ImageError::from_tiff_encode)?;
-        match color_type {
-            ExtendedColorType::L8 => encoder.write_image::<Gray8>(width, height, buf),
-            ExtendedColorType::Rgb8 => encoder.write_image::<RGB8>(width, height, buf),
-            ExtendedColorType::Rgba8 => encoder.write_image::<RGBA8>(width, height, buf),
-            ExtendedColorType::L16 => {
-                encoder.write_image::<Gray16>(width, height, u8_slice_as_pod::<u16>(buf)?.as_ref())
-            }
-            ExtendedColorType::Rgb16 => {
-                encoder.write_image::<RGB16>(width, height, u8_slice_as_pod::<u16>(buf)?.as_ref())
-            }
-            ExtendedColorType::Rgba16 => {
-                encoder.write_image::<RGBA16>(width, height, u8_slice_as_pod::<u16>(buf)?.as_ref())
-            }
-            ExtendedColorType::Rgb32F => encoder.write_image::<RGB32Float>(
-                width,
-                height,
-                u8_slice_as_pod::<f32>(buf)?.as_ref(),
-            ),
-            ExtendedColorType::Rgba32F => encoder.write_image::<RGBA32Float>(
-                width,
-                height,
-                u8_slice_as_pod::<f32>(buf)?.as_ref(),
-            ),
-            _ => {
-                return Err(ImageError::Unsupported(
-                    UnsupportedError::from_format_and_kind(
-                        ImageFormat::Tiff.into(),
-                        UnsupportedErrorKind::Color(color_type),
-                    ),
-                ))
-            }
-        }
-        .map_err(ImageError::from_tiff_encode)?;
 
-        Ok(())
+        // pre-computed conversion coefficients per TIFF 6.0 spec
+        Self {
+            cr_r: 2.0 * (1.0 - kr),
+            cb_b: 2.0 * (1.0 - kb),
+            cr_g: 2.0 * kr * (1.0 - kr) / kg,
+            cb_g: 2.0 * kb * (1.0 - kb) / kg,
+        }
     }
 }
 
-impl<W: Write + Seek> ImageEncoder for TiffEncoder<W> {
-    #[track_caller]
-    fn write_image(
-        self,
-        buf: &[u8],
-        width: u32,
-        height: u32,
-        color_type: ExtendedColorType,
-    ) -> ImageResult<()> {
-        self.encode(buf, width, height, color_type)
+impl Default for YCbCrCoefficients {
+    fn default() -> Self {
+        Self::from_luma(&TIFF_BT_601_COEFF)
+    }
+}
+
+/// Convert YCbCr to RGB for 8-bit images
+fn ycbcr_to_rgb(ycbcr: &[u8], coeffs: &YCbCrCoefficients, ref_bw: &[f32; 6]) -> [u8; 3] {
+    let y = f32::from(ycbcr[0]);
+    let cb = f32::from(ycbcr[1]);
+    let cr = f32::from(ycbcr[2]);
+
+    let y_norm = (y - ref_bw[0]) / (ref_bw[1] - ref_bw[0]);
+
+    let cb_norm = (cb - ref_bw[2]) / (ref_bw[3] - ref_bw[2]) - 0.5;
+    let cr_norm = (cr - ref_bw[4]) / (ref_bw[5] - ref_bw[4]) - 0.5;
+
+    let r = y_norm + coeffs.cr_r * cr_norm;
+    let g = y_norm - coeffs.cb_g * cb_norm - coeffs.cr_g * cr_norm;
+    let b = y_norm + coeffs.cb_b * cb_norm;
+
+    [
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+/// Convert YCbCr to RGB for 16-bit images
+fn ycbcr_to_rgb16(ycbcr: &[u16], coeffs: &YCbCrCoefficients, ref_bw: &[f32; 6]) -> [u16; 3] {
+    let y = f32::from(ycbcr[0]);
+    let cb = f32::from(ycbcr[1]);
+    let cr = f32::from(ycbcr[2]);
+
+    let y_norm = (y - ref_bw[0]) / (ref_bw[1] - ref_bw[0]);
+
+    let cb_norm = (cb - ref_bw[2]) / (ref_bw[3] - ref_bw[2]) - 0.5;
+    let cr_norm = (cr - ref_bw[4]) / (ref_bw[5] - ref_bw[4]) - 0.5;
+
+    let r = y_norm + coeffs.cr_r * cr_norm;
+    let g = y_norm - coeffs.cb_g * cb_norm - coeffs.cr_g * cr_norm;
+    let b = y_norm + coeffs.cb_b * cb_norm;
+
+    [
+        (r.clamp(0.0, 1.0) * 65535.0).round() as u16,
+        (g.clamp(0.0, 1.0) * 65535.0).round() as u16,
+        (b.clamp(0.0, 1.0) * 65535.0).round() as u16,
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ImageReader;
+
+    use std::path::Path;
+
+    #[test]
+    fn test_read_image_file() {
+        // NOTE: Image taken from GitHub issue: https://github.com/image-rs/image/issues/2530
+        let path = Path::new("tests/images/tiff/testsuite/ycbcr_to_rgb.tif");
+
+        let decode_result = ImageReader::open(&path).unwrap().decode();
+        assert!(decode_result.is_ok(), "failed to open image");
+
+        let mut jpg_path = path.to_path_buf();
+        jpg_path.set_extension("jpg");
+
+        let decoded = decode_result.unwrap();
+        let save_result = decoded.save(jpg_path);
+        assert!(save_result.is_ok());
     }
 }
