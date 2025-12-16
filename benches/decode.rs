@@ -69,6 +69,7 @@ fn load_all(c: &mut Criterion) {
                 "rgb-3c-16b.tiff",
                 "rgb32f_bw.tiff",
                 "rgb32f_color.tiff",
+                "ycbcr_to_rgb.tiff",
             ],
             format: ImageFormat::Tiff,
         },
