@@ -450,9 +450,7 @@ fn cmyk_to_rgb16(cmyk: &[u16]) -> [u16; 3] {
     ]
 }
 
-/// YCbCr to RGB conversion coefficients based on luma values
-///
-/// Conversion logic is taken from: https://libtiff.gitlab.io/libtiff/_sources/functions/TIFFcolor.rst.txt
+/// See: https://libtiff.gitlab.io/libtiff/_sources/functions/TIFFcolor.rst.txt
 struct YCbCrCoefficients {
     cr_r: f32,
     cb_b: f32,
@@ -475,7 +473,6 @@ impl YCbCrCoefficients {
             )
         };
 
-        // pre-computed conversion coefficients per TIFF 6.0 spec
         Self {
             cr_r: 2.0 * (1.0 - kr),
             cb_b: 2.0 * (1.0 - kb),
@@ -491,7 +488,6 @@ impl Default for YCbCrCoefficients {
     }
 }
 
-/// Convert YCbCr to RGB for 8-bit images
 fn ycbcr_to_rgb(ycbcr: &[u8], coeffs: &YCbCrCoefficients, ref_bw: &[f32; 6]) -> [u8; 3] {
     let y = f32::from(ycbcr[0]);
     let cb = f32::from(ycbcr[1]);
