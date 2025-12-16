@@ -331,19 +331,23 @@ impl<R: BufRead + Seek> ImageDecoder for TiffDecoder<R> {
                     out_row.copy_from_slice(&utils::expand_bits(1, width, in_row));
                 }
             }
-            DecodingResult::U8(v) if self.color_type == ColorType::Rgb8 => {
-                // TODO: get `luma` and `ref_bw_vec` once and reuse below for DecodingResult::U16
-
+            result @ (DecodingResult::U8(_) | DecodingResult::U16(_))
+                if matches!(
+                    (self.color_type, &result),
+                    (ColorType::Rgb8, DecodingResult::U8(_))
+                        | (ColorType::Rgb16, DecodingResult::U16(_))
+                ) =>
+            {
                 let luma = inner
                     .find_tag(TAG_YCBCR_COEFFICIENTS)
                     .ok()
-                    .and_then(|opt| opt)
+                    .flatten()
                     .and_then(|val| val.into_f32_vec().ok());
 
                 let ref_bw_vec = inner
                     .find_tag(TAG_YCBCR_REFERENCE_BLACK_WHITE)
                     .ok()
-                    .and_then(|opt| opt)
+                    .flatten()
                     .and_then(|val| val.into_f32_vec().ok());
 
                 let coeffs = luma
@@ -351,56 +355,35 @@ impl<R: BufRead + Seek> ImageDecoder for TiffDecoder<R> {
                     .map(YCbCrCoefficients::from_luma)
                     .unwrap_or_default();
 
-                let ref_bw = if let Some(rbw) = ref_bw_vec.as_ref() {
-                    if rbw.len() >= 6 {
-                        [rbw[0], rbw[1], rbw[2], rbw[3], rbw[4], rbw[5]]
-                    } else {
-                        YCBCR_LIMITED_RANGE_U8_DEFAULTS
-                    }
-                } else {
-                    YCBCR_LIMITED_RANGE_U8_DEFAULTS
+                let default_ref_bw = match &result {
+                    DecodingResult::U8(_) => YCBCR_LIMITED_RANGE_U8_DEFAULTS,
+                    DecodingResult::U16(_) => YCBCR_LIMITED_RANGE_U16_DEFAULTS,
+                    _ => unreachable!(),
                 };
 
-                let mut out_cur = Cursor::new(buf);
-                for ycbcr_pixel in v.chunks_exact(3) {
-                    let ycbcr_bytes = ycbcr_to_rgb(ycbcr_pixel, &coeffs, &ref_bw);
-                    let bytes = bytemuck::cast_slice(&ycbcr_bytes);
-                    out_cur.write_all(bytes)?;
-                }
-            }
-            DecodingResult::U16(v) if self.color_type == ColorType::Rgb16 => {
-                let luma = inner
-                    .find_tag(TAG_YCBCR_COEFFICIENTS)
-                    .ok()
-                    .and_then(|opt| opt)
-                    .and_then(|val| val.into_f32_vec().ok());
-
-                let ref_bw_vec = inner
-                    .find_tag(TAG_YCBCR_REFERENCE_BLACK_WHITE)
-                    .ok()
-                    .and_then(|opt| opt)
-                    .and_then(|val| val.into_f32_vec().ok());
-
-                let coeffs = luma
+                let ref_bw = ref_bw_vec
                     .as_ref()
-                    .map(YCbCrCoefficients::from_luma)
-                    .unwrap_or_default();
-
-                let ref_bw = if let Some(rbw) = ref_bw_vec.as_ref() {
-                    if rbw.len() >= 6 {
-                        [rbw[0], rbw[1], rbw[2], rbw[3], rbw[4], rbw[5]]
-                    } else {
-                        YCBCR_LIMITED_RANGE_U16_DEFAULTS
-                    }
-                } else {
-                    YCBCR_LIMITED_RANGE_U16_DEFAULTS
-                };
+                    .and_then(|rbw| {
+                        (rbw.len() >= 6).then(|| [rbw[0], rbw[1], rbw[2], rbw[3], rbw[4], rbw[5]])
+                    })
+                    .unwrap_or(default_ref_bw);
 
                 let mut out_cur = Cursor::new(buf);
-                for ycbcr_pixel in v.chunks_exact(3) {
-                    let ycbcr_bytes = ycbcr_to_rgb16(ycbcr_pixel, &coeffs, &ref_bw);
-                    let bytes = bytemuck::cast_slice(&ycbcr_bytes);
-                    out_cur.write_all(bytes)?;
+
+                match result {
+                    DecodingResult::U8(v) => {
+                        for ycbcr_pixel in v.chunks_exact(3) {
+                            let rgb = ycbcr_to_rgb(ycbcr_pixel, &coeffs, &ref_bw);
+                            out_cur.write_all(&rgb)?;
+                        }
+                    }
+                    DecodingResult::U16(v) => {
+                        for ycbcr_pixel in v.chunks_exact(3) {
+                            let rgb = ycbcr_to_rgb16(ycbcr_pixel, &coeffs, &ref_bw);
+                            out_cur.write_all(bytemuck::cast_slice(&rgb))?;
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
             DecodingResult::U8(v) => {
