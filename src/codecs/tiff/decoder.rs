@@ -507,13 +507,12 @@ fn ycbcr_to_rgb(ycbcr: &[u8], coeffs: &YCbCrCoefficients, ref_bw: &[f32; 6]) -> 
     let b = y_norm + coeffs.cb_b * cb_norm;
 
     [
-        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (r.clamp(0., 1.) * 255.) as u8,
+        (g.clamp(0., 1.) * 255.) as u8,
+        (b.clamp(0., 1.) * 255.) as u8,
     ]
 }
 
-/// Convert YCbCr to RGB for 16-bit images
 fn ycbcr_to_rgb16(ycbcr: &[u16], coeffs: &YCbCrCoefficients, ref_bw: &[f32; 6]) -> [u16; 3] {
     let y = f32::from(ycbcr[0]);
     let cb = f32::from(ycbcr[1]);
@@ -529,8 +528,8 @@ fn ycbcr_to_rgb16(ycbcr: &[u16], coeffs: &YCbCrCoefficients, ref_bw: &[f32; 6]) 
     let b = y_norm + coeffs.cb_b * cb_norm;
 
     [
-        (r.clamp(0.0, 1.0) * 65535.0).round() as u16,
-        (g.clamp(0.0, 1.0) * 65535.0).round() as u16,
-        (b.clamp(0.0, 1.0) * 65535.0).round() as u16,
+        (r.clamp(0., 1.) * 65535.) as u16,
+        (g.clamp(0., 1.) * 65535.) as u16,
+        (b.clamp(0., 1.) * 65535.) as u16,
     ]
 }
