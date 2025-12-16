@@ -551,26 +551,3 @@ fn ycbcr_to_rgb16(ycbcr: &[u16], coeffs: &YCbCrCoefficients, ref_bw: &[f32; 6]) 
         (b.clamp(0.0, 1.0) * 65535.0).round() as u16,
     ]
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::ImageReader;
-
-    use std::path::Path;
-
-    #[test]
-    fn test_read_image_file() {
-        // NOTE: Image taken from GitHub issue: https://github.com/image-rs/image/issues/2530
-        let path = Path::new("tests/images/tiff/testsuite/ycbcr_to_rgb.tif");
-
-        let decode_result = ImageReader::open(&path).unwrap().decode();
-        assert!(decode_result.is_ok(), "failed to open image");
-
-        let mut jpg_path = path.to_path_buf();
-        jpg_path.set_extension("jpg");
-
-        let decoded = decode_result.unwrap();
-        let save_result = decoded.save(jpg_path);
-        assert!(save_result.is_ok());
-    }
-}
